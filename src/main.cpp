@@ -1,337 +1,311 @@
 // Наземная станция для нашего аппарата
-/*
- функции кода:        1) Приём телеметрии с нрф и лора модулей
-                      2) Запись всего на сд карту
-                      3) Скидываем всю телеметрию в последовательный порт
-                      4) Всю информацию выводим на oled дисплей( или два дисплея)
-                      5) Счётчик пакетов + рассчётная плотность пакетов по времени
-
-*/
-
-// todo: система контроля "свежести" пакетов
-//       светодиодная индикация 
-//       тестовые режимы работы для проверки исправности перед пуском
-//       сделать отправку основной телеметрии и на комп через usb-ttl
-//       создать схему-распиновку для подключения модулей 
-//       добавить оповещение о большой разнице в количестве разных типов пакетов 
-
-#include <Arduino.h>
-
 #include <SPI.h>
 #include <SD.h>
-
-#include <nRF24L01.h>
-#include <RF24.h>
-
+#include <LoRa.h>
 #include <Wire.h>
-
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-#include <FastLED.h>
+#include "nRF24L01.h"
+#include "RF24.h"
+#include "printf.h"
+#define SCREEN_WIDTH 128
 
-#include <LoRa.h>
+#define OLED_DC     25
+#define OLED_CS     31
+#define OLED_RESET  29
+Adafruit_SSD1306 displayBig(SCREEN_WIDTH, 64, &SPI, OLED_DC, OLED_RESET, OLED_CS);
+Adafruit_SSD1306 displaySmall(SCREEN_WIDTH, 32, &Wire, -1);
 
-#include <DFPlayer_Mini_Mp3.h>
-
-#define LORA_D0 42
-#define LORA_NSS 43
-#define LORA_RST 44
-
-#define NRF_CSN 40
-#define NRF_CE 41
-
-#define SD_CS 25
-
-#define LED1 10
-#define LED2 11
-
-#define LED_PIN 45
-#define NUM_LEDS    8
-#define BRIGHTNESS  20
-#define LED_TYPE    WS2811
-#define COLOR_ORDER GRB
-CRGB leds[NUM_LEDS];
-
-#define UPDATES_PER_SECOND 100 
-
-CRGBPalette16 currentPalette;
-TBlendType    currentBlending;
-
-RF24 radio(NRF_CE, NRF_CSN);
-
-Adafruit_SSD1306 display(128, 32, &Wire, -1);
+RF24 radio(5, 6);
+const uint8_t num_channels = 126;
+uint8_t values[num_channels];
 
 
-
-int8_t buttons[4] = { 31, 32, 33, 34};
-int8_t mod_sw[8] = { A14, A13, A12, A11, A10, A9, A8, A7 };
-
-uint8_t mode; // 0-256
-
-struct sec_strctr
+struct frstSrt
 {
-  uint8_t id = 0;
-  uint8_t x_acs;    // 1 byte
-  uint16_t z_acs;   // 2 byte
-  uint16_t timeGPS; // 2 bytes
-  uint16_t co2_ppm; // 2 bytes
-  float temp;       // 4 bytes
-  float pressure;   // 4 bytes
-  float lonGPS;     // 4 bytes
+  uint8_t id = 0;   // 1 byte
+  int16_t x_acs;    // 2 bytes
+  int16_t y_acs;    // 2 bytes
+  int16_t z_acs;    // 2 bytes
+  int16_t trsh1;    // 2 bytes
+  float trsh2;
+  float trsh3;
+  float trsh4;
+  float presssure;  // 4 bytes
   uint32_t counter; // 4 bytes
-}radioData1, midData;
+} fastData, midData;
 
-struct trd_strctr
+struct secStr
 {
-  uint8_t id = 1;
-  uint8_t y_acs;    // 1 byte
-  uint16_t pm25_qw; // 2 bytes
-  uint16_t tVOC;    // 2 bytes
-  uint16_t rad_qw;  // 2 bytes
-  float trsh;       // 2 bytes
+  uint8_t id = 1;   // 1 byte
+  int16_t pm25;    // 2 bytes
+  int16_t tVOC;    // 2 bytes
+  int16_t rad_qw;  // 2 bytes
+  int16_t co2_ppm; // 2 bytes
   float lanGPS;     // 4 bytes
+  float lonGPS;     // 4 bytes
   float humidVal;   // 4 bytes
+  float temp;       // 4 bytes
   uint32_t counter; // 4 bytes
-}radioData2;
-
-void writeSD();
-void recieveNRF();
-void recieveLoRa();
-void displayInfo();
-void displayLEDs();
-void readMode();
-void printSerial();
-void startErr();
-void noNrfDataErr();
-void noLoRaDataErr();
-void SDwriteErr();
+} slowData;           // 29 bytes: 29 / 250Kbps = 0.9ms - max max delay (in theory)
 
 
+File myFile;
 
-
-void setup() 
-{
-  for(int i=0;i<8;i++)
-  pinMode(mod_sw[i], INPUT_PULLUP);  
-  pinMode(LED1, OUTPUT);
-  pinMode(LED2, OUTPUT);
-  analogWrite(LED1, 10);
-  analogWrite(LED2, 100);
-
-  pinMode(LORA_NSS, OUTPUT);
-  pinMode(LORA_RST, OUTPUT);
-  pinMode(NRF_CSN, OUTPUT);
-  pinMode(NRF_CE, OUTPUT);
-  pinMode(SD_CS, OUTPUT);
-  
-  pinMode(LED_PIN, OUTPUT);
-
+void setup() {
   Serial.begin(115200);
-  SPI.begin();                                               // инициализируем работу с SPI
-  SPI.setDataMode(SPI_MODE3);   
-  
-  if (!SD.begin(SD_CS)) {
-			Serial.println("Card Failure");
-      startErr();
-	}
-  else
-    Serial.println("Card Ready");
-  
-
-  if (!LoRa.begin(433E6)) 
-  {
-    Serial.println("Starting LoRa failed!");
-    startErr();
-  }
-  else
-    Serial.println("LoRa started without errors");
-  
-  mp3_set_serial(Serial2);
-  mp3_set_volume(25);
-  mp3_play (1);
-
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) 
-  { 
+  if (!displayBig.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
     Serial.println(F("SSD1306 allocation failed"));
-    startErr();
+    for (;;); // Don't proceed, loop forever
   }
-  else
-    Serial.println("Display started sucsessfully");
+  if (!displaySmall.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;); // Don't proceed, loop forever
+  }
+  SPI.begin();                                               // инициализируем работу с SPI
+  SPI.setDataMode(SPI_MODE3);
+  Serial.begin(115200);
+  printf_begin();
+  LoRa.setPins(4, 3, 2);
 
-  display.display();
-  display.clearDisplay();
-  
-  display.display();
-  if(!radio.begin())
-  {
-      Serial.println("nrf err");
-      startErr();
+  Serial.println("LoRa Receiver");
+
+  if (!LoRa.begin(433E6)) {
+    Serial.println("Starting LoRa failed!");
+    while (1);
   }
-  else
-    Serial.println("NRF started without errors");
-  radio.setChannel(100);                               
-  radio.setDataRate     (RF24_250KBPS);                   
-  radio.setPALevel      (RF24_PA_HIGH);                 
-  radio.openWritingPipe (0x1231163366LL);               
+
+  radio.begin();
+  radio.setChannel(120);                                // Указываем канал приёма данных (от 0 до 127), 5 - значит приём данных осуществляется на частоте 2,405 ГГц (на одном канале может быть только 1 приёмник и до 6 передатчиков)
+  radio.setDataRate     (RF24_250KBPS);                   // Указываем скорость передачи данных (RF24_250KBPS, RF24_1MBPS, RF24_2MBPS), RF24_1MBPS - 1Мбит/сек
+  radio.setPALevel      (RF24_PA_MAX);                 // Указываем мощность передатчика (RF24_PA_MIN=-18dBm, RF24_PA_LOW=-12dBm, RF24_PA_HIGH=-6dBm, RF24_PA_MAX=0dBm)
+  radio.openReadingPipe (0, 0x1234567899LL);            // Открываем 1 трубу с идентификатором 0x1234567890 для приема данных (на ожном канале может быть открыто до 6 разных труб, которые должны отличаться только последним байтом идентификатора)
   radio.setAutoAck(false);
-  delay(2000);
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection( TypicalLEDStrip );
-    FastLED.setBrightness(  BRIGHTNESS );
-  
-}
+  radio.startListening  ();
+  radio.printDetails();
+  Serial.print("Initializing SD card...");
 
-void loop() 
-{
-  recieveNRF();
-  recieveLoRa();
-  readMode();
-  displayInfo();
-  displayLEDs();
-}
+  if (!SD.begin(7)) {
+    Serial.println("initialization failed!");
+    return;
+  }
+  Serial.println("initialization done.");
 
-void writeSD()
-{
-    File allData = SD.open("Eco.csv", FILE_WRITE);
-    if(!allData)
-    {
-      SDwriteErr();
+  myFile = SD.open("test.txt", FILE_WRITE);
+
+  // if the file opened okay, write to it:
+  if (myFile) {
+    Serial.print("Writing to test.txt...");
+    myFile.println("hello there!");
+    // close the file:
+    myFile.close();
+    Serial.println("done.");
+  } else {
+    // if the file didn't open, print an error:
+    Serial.println("error opening test.txt");
+  }
+
+  // re-open the file for reading:
+  myFile = SD.open("test.txt");
+  if (myFile) {
+    Serial.println("test.txt:");
+
+    // read from the file until there's nothing else in it:
+    while (myFile.available()) {
+      Serial.write(myFile.read());
     }
-   else if (allData)
-    {
+    // close the file:
+    myFile.close();
+  } else {
+    // if the file didn't open, print an error:
+    Serial.println("error opening test.txt");
+  }
+    displayBig.clearDisplay();
+    displayBig.setTextSize(2);      // 2:1 pixel scale
+    displayBig.setTextColor(WHITE);
+    displayBig.setCursor(0, 0);
+    displayBig.cp437(true);
     
-      allData.print(radioData1.x_acs);
-      allData.print(";");
-      allData.print(radioData2.y_acs);
-      allData.print(";");
-      allData.print(radioData1.z_acs);
-      allData.print(";");
-      allData.print(radioData1.temp);
-      allData.print(";");
-      allData.print(radioData1.pressure);
-      allData.print(";");
-      allData.print(radioData1.lonGPS);
-      allData.print(";");
-      allData.print(radioData2.lanGPS);
-      allData.print(";");
-      allData.print(radioData1.timeGPS);
-      allData.print(";");
-      allData.print(radioData1.co2_ppm);
-      allData.print(";");
-      allData.print(radioData2.pm25_qw);
-      allData.print(";");
-      allData.print(radioData2.tVOC);
-      allData.print(";");
-      allData.print(radioData2.rad_qw);
-      allData.print(";");
-      allData.print(radioData2.humidVal);
-      allData.print(";");
-      allData.print(radioData1.counter);
-      allData.print(";");
-      allData.print(radioData2.counter);
-      allData.print(";");
-      allData.println(millis()/100);
-      allData.close();
-    }
+    displayBig.println(fastData.presssure, 2);
+    displayBig.print(fastData.x_acs);
+    displayBig.print(" ");
+    displayBig.print(fastData.y_acs);
+    displayBig.print(" ");
+    displayBig.println(fastData.z_acs);
+    displayBig.println(fastData.counter);
+    displayBig.println(slowData.temp);
+    displaySmall.clearDisplay();
+    displaySmall.setTextSize(1);      // Normal 1:1 pixel scale
+    displaySmall.setTextColor(WHITE);
+    displaySmall.setCursor(0, 0);
+    displaySmall.cp437(true);
+    displaySmall.println(slowData.lanGPS, 7);
+    displaySmall.println(slowData.lonGPS, 7);
+    displaySmall.print(slowData.pm25);
+    displaySmall.print(" ");
+    displaySmall.print(slowData.tVOC);
+    displaySmall.print(" ");
+    displaySmall.println(slowData.humidVal);
+    displaySmall.print(slowData.rad_qw);
+    displaySmall.print(" ");
+    displaySmall.print(slowData.co2_ppm);
+    displaySmall.display();
+    displayBig.display();
+  delay(300);
+
 }
-void recieveNRF()
+
+
+void loop()
 {
-  if(radio.available())
+  if (radio.available())
   {
     radio.read(&midData, sizeof(midData));
     if(midData.id == 0)
     {
-      radioData1 = midData;
-    }
-    else if(midData.id == 1)
-    {
-      radioData2.y_acs = midData.x_acs;
-      radioData2.pm25_qw = midData.z_acs;
-      radioData2.tVOC = midData.timeGPS;
-      radioData2.rad_qw = midData.co2_ppm;
-      radioData2.trsh = midData.temp;
-      radioData2.lanGPS = midData.pressure;
-      radioData2.humidVal = midData.lonGPS;
-      radioData2.counter = midData.counter;
-      writeSD();
-    }
-  }
-}
+      fastData=midData;
+      Serial.print(millis());
+      Serial.print(",");
+      Serial.print(fastData.x_acs);
+      Serial.print(",");
+      Serial.print(fastData.y_acs);
+      Serial.print(",");
+      Serial.print(fastData.z_acs);
+      Serial.print(",");
+      Serial.print(fastData.presssure);
+      Serial.print(",");
+      Serial.println(fastData.counter);
+      myFile = SD.open("its_wednesday_dd.txt", FILE_WRITE);
 
-void recieveLoRa()
-{
-  int packetSize = LoRa.parsePacket();
-  if (packetSize) 
-  {
-    while (LoRa.available()) 
+      // if the file opened okay, write to it:
+      if (myFile) 
+      {
+        myFile.print(millis());
+        myFile.print(",");
+        myFile.print(fastData.x_acs);
+        myFile.print(",");
+        myFile.print(fastData.y_acs);
+        myFile.print(",");
+        myFile.print(fastData.z_acs);
+        myFile.print(",");
+        myFile.print(fastData.presssure);
+        myFile.print(",");
+        myFile.println(fastData.counter);
+        myFile.close();
+      }
+    }
+    else
     {
+      slowData.pm25 = midData.x_acs;
+      slowData.tVOC = midData.y_acs;
+      slowData.rad_qw = midData.z_acs;
+      slowData.co2_ppm = midData.trsh1;
+      slowData.lanGPS = midData.trsh2;
+      slowData.lonGPS = midData.trsh3;
+      slowData.humidVal = midData.trsh4;
+      slowData.temp = midData.presssure;
+      slowData.counter = midData.counter;
+      Serial.print(millis());
+      Serial.print(",");
+      Serial.print(",");
+      Serial.print(",");
+      Serial.print(",");
+      Serial.print(",");
+      Serial.print(slowData.counter);
+      Serial.print(",");
+      Serial.print(slowData.pm25);
+      Serial.print(",");
+      Serial.print(slowData.tVOC);
+      Serial.print(",");
+      Serial.print(slowData.rad_qw);
+      Serial.print(",");
+      Serial.print(slowData.co2_ppm);
+      Serial.print(",");
+      Serial.print(slowData.humidVal);
+      Serial.print(",");
+      Serial.print(slowData.temp);
+      Serial.print(",");
+      Serial.print(slowData.lanGPS, 7);
+      Serial.print(",");
+      Serial.println(slowData.lonGPS, 7);
+      myFile = SD.open("its_wednesday_dd.txt", FILE_WRITE);
+
+      // if the file opened okay, write to it:
+      if (myFile) 
+      {
+        myFile.print(millis());
+        myFile.print(",");
+        myFile.print(",");
+        myFile.print(",");
+        myFile.print(",");
+        myFile.print(",");
+        myFile.print(slowData.counter);
+        myFile.print(",");
+        myFile.print(slowData.pm25);
+        myFile.print(",");
+        myFile.print(slowData.tVOC);
+        myFile.print(",");
+        myFile.print(slowData.rad_qw);
+        myFile.print(",");
+        myFile.print(slowData.co2_ppm);
+        myFile.print(",");
+        myFile.print(slowData.humidVal);
+        myFile.print(",");
+        myFile.print(slowData.temp);
+        myFile.print(",");
+        myFile.print(slowData.lanGPS, 7);
+        myFile.print(",");
+        myFile.println(slowData.lonGPS, 7);
+        myFile.close();
+      }
+      
+    } 
+    displayBig.clearDisplay();
+    displayBig.setTextSize(2);      // 2:1 pixel scale
+    displayBig.setTextColor(WHITE);
+    displayBig.setCursor(0, 0);
+    displayBig.cp437(true);
+    
+    displayBig.println(fastData.presssure, 2);
+    displayBig.print(fastData.x_acs);
+    displayBig.print(" ");
+    displayBig.print(fastData.y_acs);
+    displayBig.print(" ");
+    displayBig.println(fastData.z_acs);
+    displayBig.println(fastData.counter);
+    displayBig.println(slowData.temp);
+    displaySmall.clearDisplay();
+    displaySmall.setTextSize(1);      // Normal 1:1 pixel scale
+    displaySmall.setTextColor(WHITE);
+    displaySmall.setCursor(0, 0);
+    displaySmall.cp437(true);
+    displaySmall.println(slowData.lanGPS, 7);
+    displaySmall.println(slowData.lonGPS, 7);
+    displaySmall.print(slowData.pm25);
+    displaySmall.print(" ");
+    displaySmall.print(slowData.tVOC);
+    displaySmall.print(" ");
+    displaySmall.println(slowData.humidVal);
+    displaySmall.print(slowData.rad_qw);
+    displaySmall.print(" ");
+    displaySmall.print(slowData.co2_ppm);
+    displaySmall.display();
+    displayBig.display();
+  }
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    // received a packet
+    Serial.print("Received packet '");
+
+    // read packet
+    while (LoRa.available()) {
       Serial.print((char)LoRa.read());
     }
+
+    // print RSSI of packet
+    Serial.print("' with RSSI ");
+    Serial.println(LoRa.packetRssi());
   }
 }
-
-void displayInfo()
-{
-  display.clearDisplay();
-  display.setTextSize(1);             
-  display.setTextColor(WHITE);       
-  display.setCursor(0, 0);            
-  display.println(radioData1.lonGPS, 7);            
-  display.println(radioData2.lanGPS);
-  display.print(radioData1.temp);      
-  display.print("  ");  
-  display.println(radioData1.pressure);
-  display.print(radioData1.counter);
-  display.display();
-}
-
-
-
-void displayLEDs()
-{
-  // todo - система индикации через светодиодную ленту
-}
-
-
-void readMode()
-{
-  bitWrite(mode, 0, (!digitalRead(A14)));
-  bitWrite(mode, 1, (!digitalRead(A13)));
-  bitWrite(mode, 2, (!digitalRead(A12)));
-  bitWrite(mode, 3, (!digitalRead(A11)));
-  bitWrite(mode, 4, (!digitalRead(A10)));
-  bitWrite(mode, 5, (!digitalRead(A9)));
-  bitWrite(mode, 6, (!digitalRead(A8)));
-  bitWrite(mode, 7, (!digitalRead(A7)));
-}
-
-void printSerial()
-{
-  // todo - решить что лучше слать на комп
-}
-
-void startErr()
-{
-  mp3_play(9);
-  Serial.println("startErr, need reboot");
-}
-
-void noNrfDataErr()
-{
-  mp3_play(10);
-  Serial.println("no packages from NRF for a long time");
-}
-
-void noLoRaDataErr()
-{
-  mp3_play(11);
-  Serial.println("no packages from LoRa for a long time");
-}
-
-void SDwriteErr()
-{
-  mp3_play(12);
-  Serial.println("Can't open SD for writing");
-}
-
 
