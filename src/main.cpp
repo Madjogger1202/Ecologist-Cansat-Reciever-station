@@ -176,7 +176,7 @@ void loop()
       Serial.print(fastData.presssure);
       Serial.print(",");
       Serial.println(fastData.counter);
-      myFile = SD.open("its_wednesday_dd.txt", FILE_WRITE);
+      myFile = SD.open("its_wednesday_dd.csv", FILE_WRITE);
 
       // if the file opened okay, write to it:
       if (myFile) 
@@ -229,7 +229,7 @@ void loop()
       Serial.print(slowData.lanGPS, 7);
       Serial.print(",");
       Serial.println(slowData.lonGPS, 7);
-      myFile = SD.open("its_wednesday_dd.txt", FILE_WRITE);
+      myFile = SD.open("its_wednesday_dd_bt_sloww.csv", FILE_WRITE);
 
       // if the file opened okay, write to it:
       if (myFile) 
